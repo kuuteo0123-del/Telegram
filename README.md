@@ -1,206 +1,112 @@
-"""Main bot script: Telegram ingress + batch durable queue + browser processing."""
-
 from __future__ import annotations
 
-import asyncio
 import os
-import threading
-import time
-from typing import Any
+from dataclasses import dataclass, field
+from pathlib import Path
 
-from config import get_config
-from database import CodeDatabase, init_database
-from durable_inbox_v2 import DurableInboxV2
-from logger_setup import logger
-from queue_manager import DomainQueueItem, DomainQueueManager
-from browser_engine import BrowserEngine
-from browser_adapter import BrowserAdapter
-from code_validator import extract_codes_from_text, iter_codes_from_message
-
-try:
-    from telethon import TelegramClient
-    from telethon.errors import FloodWaitError, SessionPasswordNeededError
-except Exception:  # pragma: no cover
-    TelegramClient = None
-    FloodWaitError = Exception
-    SessionPasswordNeededError = Exception
+from dotenv import load_dotenv
 
 
-class AutoBot:
-    def __init__(self, env_path: str | None = None):
-        self.config = get_config(env_path)
-        self.database = init_database(self.config.database_path)
-        self.inbox = DurableInboxV2(self.config.inbox_db_path, max_attempts=self.config.max_inbox_attempts, retry_base_delay=self.config.inbox_retry_base_delay, retry_max_delay=self.config.inbox_retry_max_delay)
-        self.queue_manager = DomainQueueManager(max_per_domain=self.config.max_concurrent_processing)
-        self.browser = BrowserEngine(self.config.edge_cdp_host, self.config.edge_cdp_port)
-        self.adapter = BrowserAdapter(self.browser)
-        self.running = True
-        self.lock = threading.RLock()
-        self._threads: list[threading.Thread] = []
+@dataclass
+class AppConfig:
+    api_id: int = 0
+    api_hash: str = ""
+    session_name: str = "session_autobot"
+    alert_bot_token: str = ""
+    alert_chat_id: int = 0
+    telegram_admin_id: int = 0
+    database_path: str = "data/code_history.db"
+    inbox_db_path: str = "data/telegram_inbox.db"
+    log_file: str = "logs/bot_activity.log"
+    edge_cdp_host: str = "127.0.0.1"
+    edge_cdp_port: int = 9222
+    edge_executable_path: str | None = None
+    active_domains: list[str] = field(default_factory=lambda: ["xx88", "mm88", "rr88", "gg88", "qq88", "hi88", "o8"])
+    channel_ids: dict[str, list[int]] = field(default_factory=dict)
+    channel_poll_interval: float = 1.0
+    channel_poll_request_timeout: float = 5.0
+    channel_poll_max_inflight: int = 3
+    code_max_age_seconds: int = 120
+    max_inbox_attempts: int = 5
+    inbox_retry_base_delay: float = 2.0
+    inbox_retry_max_delay: float = 120.0
+    max_concurrent_processing: int = 50
+    message_workers: int = 6
+    max_concurrent_submits_per_domain: int = 2
+    accounts_per_code: int = 2
+    single_round_per_batch: bool = False
+    requests_per_minute: int = 30
+    max_burst: int = 5
+    retry_on_timeout: bool = True
+    debug_verbose_mode: bool = False
+    log_level: str = "INFO"
 
-        if TelegramClient is not None:
-            self.telegram_client = TelegramClient(
-                self.config.session_name,
-                self.config.api_id,
-                self.config.api_hash,
-            )
+    @staticmethod
+    def _bool(value: str | None, default: bool = False) -> bool:
+        if value is None:
+            return default
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    @classmethod
+    def from_env(cls, env_path: str | None = None) -> "AppConfig":
+        if env_path:
+            load_dotenv(dotenv_path=env_path, override=False)
         else:
-            self.telegram_client = None
+            load_dotenv(override=False)
 
-    def start(self):
-        logger.info("✅ AutoBot starting...")
-        self.browser.connect()
+        cfg = cls()
+        cfg.api_id = int(os.getenv("API_ID", "0") or 0)
+        cfg.api_hash = str(os.getenv("API_HASH", "") or "")
+        cfg.session_name = str(os.getenv("SESSION_NAME", "session_autobot") or "session_autobot")
+        cfg.alert_bot_token = str(os.getenv("ALERT_BOT_TOKEN", "") or "")
+        cfg.alert_chat_id = int(os.getenv("ALERT_CHAT_ID", "0") or 0)
+        cfg.telegram_admin_id = int(os.getenv("TELEGRAM_ADMIN_ID", "0") or 0)
+        cfg.database_path = str(os.getenv("DATABASE_PATH", "data/code_history.db") or "data/code_history.db")
+        cfg.inbox_db_path = str(os.getenv("TELEGRAM_INBOX_DB_PATH", "data/telegram_inbox.db") or "data/telegram_inbox.db")
+        cfg.log_file = str(os.getenv("LOG_FILE", "logs/bot_activity.log") or "logs/bot_activity.log")
+        cfg.edge_cdp_host = str(os.getenv("EDGE_CDP_HOST", "127.0.0.1") or "127.0.0.1")
+        cfg.edge_cdp_port = int(os.getenv("EDGE_CDP_PORT", "9222") or 9222)
+        cfg.edge_executable_path = os.getenv("EDGE_EXECUTABLE_PATH") or None
+        cfg.channel_poll_interval = float(os.getenv("CHANNEL_POLL_INTERVAL", "1.0") or 1.0)
+        cfg.channel_poll_request_timeout = float(os.getenv("CHANNEL_POLL_REQUEST_TIMEOUT", "5.0") or 5.0)
+        cfg.channel_poll_max_inflight = max(1, int(os.getenv("CHANNEL_POLL_MAX_INFLIGHT", "3") or 3))
+        cfg.code_max_age_seconds = max(1, int(os.getenv("CODE_MAX_AGE_SECONDS", "120") or 120))
+        cfg.max_inbox_attempts = max(1, int(os.getenv("MAX_INBOX_ATTEMPTS", "5") or 5))
+        cfg.inbox_retry_base_delay = max(0.1, float(os.getenv("INBOX_RETRY_BASE_DELAY", "2.0") or 2.0))
+        cfg.inbox_retry_max_delay = max(cfg.inbox_retry_base_delay, float(os.getenv("INBOX_RETRY_MAX_DELAY", "120.0") or 120.0))
+        cfg.max_concurrent_processing = max(1, int(os.getenv("MAX_CONCURRENT_PROCESSING", "50") or 50))
+        cfg.message_workers = max(1, int(os.getenv("MESSAGE_WORKERS", "6") or 6))
+        cfg.max_concurrent_submits_per_domain = max(1, int(os.getenv("MAX_CONCURRENT_SUBMITS_PER_DOMAIN", "2") or 2))
+        cfg.accounts_per_code = max(1, int(os.getenv("ACCOUNTS_PER_CODE", "2") or 2))
+        cfg.single_round_per_batch = cls._bool(os.getenv("SINGLE_ROUND_PER_BATCH"), False)
+        cfg.requests_per_minute = max(1, int(os.getenv("REQUESTS_PER_MINUTE", "30") or 30))
+        cfg.max_burst = max(1, int(os.getenv("MAX_BURST", "5") or 5))
+        cfg.retry_on_timeout = cls._bool(os.getenv("RETRY_ON_TIMEOUT"), True)
+        cfg.debug_verbose_mode = cls._bool(os.getenv("DEBUG_VERBOSE_MODE"), False)
+        cfg.log_level = str(os.getenv("LOG_LEVEL", "INFO") or "INFO").upper()
 
-        for _ in range(self.config.message_workers):
-            t = threading.Thread(target=self._worker_loop, daemon=True)
-            t.start()
-            self._threads.append(t)
+        active = os.getenv("ACTIVE_DOMAINS", "hi88,qq88,o8,mm88,rr88,xx88,gg88")
+        if active:
+            cfg.active_domains = [d.strip().lower() for d in active.split(",") if d.strip()]
 
-        if self.telegram_client is not None:
-            self._start_telegram_loop()
-        else:
-            logger.warning("⚠️ Telethon not available. Running demo mode only.")
-            self._demo_loop()
-
-    def _start_telegram_loop(self):
-        async def _runner():
-            await self.telegram_client.start()
-            logger.info("✅ Telegram client connected")
-            channel_ids = []
-            for lst in self.config.channel_ids.values():
-                channel_ids.extend(lst)
-            channel_ids = sorted(set(channel_ids))
-            for chat_id in channel_ids:
-                try:
-                    await self.telegram_client.get_dialogs()
-                    logger.info("📡 watching channel %s", chat_id)
-                except Exception as exc:
-                    logger.warning("⚠️ channel init warning for %s: %s", chat_id, exc)
-
-            @self.telegram_client.on(events.NewMessage(pattern=None))
-            async def handler(event):
-                await self._handle_telegram_event(event)
-
-            while self.running:
-                await asyncio.sleep(self.config.channel_poll_interval)
-
-        try:
-            asyncio.run(_runner())
-        except Exception as exc:
-            logger.error("❠ Telegram loop error: %s", exc)
-
-    def _demo_loop(self):
-        while self.running:
-            time.sleep(self.config.channel_poll_interval)
-            sample = {
-                "text": "PROMO CODE: ABCD1234 XYZ9876",
-                "chat_id": 1,
-                "message_id": int(time.time() * 1000),
-                "message_date": None,
-                "edited": False,
-                "has_media": False,
-            }
-            self._enqueue_telegram_message(sample)
-
-    async def _handle_telegram_event(self, event):
-        payload = {
-            "chat_id": getattr(event.chat, "id", 0),
-            "message_id": getattr(event, "id", 0),
-            "message_date": getattr(event, "date", None),
-            "edited": getattr(event, "edited", False),
-            "text": getattr(event, "raw_text", "") or getattr(event.message, "message", "") or "",
-            "has_media": bool(getattr(event, "photo", None) or getattr(event, "document", None)),
+        cfg.channel_ids = {
+            "xx88": [int(v) for v in [os.getenv("CHANNEL_XX88_1", "-1002817093108"), os.getenv("CHANNEL_XX88_2", "-1002768264448")] if v],
+            "mm88": [int(v) for v in [os.getenv("CHANNEL_MM88_1", "-1003134541072")] if v],
+            "rr88": [int(v) for v in [os.getenv("CHANNEL_RR88_1", "-1002386905514")] if v],
+            "gg88": [int(v) for v in [os.getenv("CHANNEL_GG88_1", "-1003731231345")] if v],
+            "qq88": [int(v) for v in [os.getenv("CHANNEL_QQ88_1", "-1002421765170")] if v],
+            "hi88": [int(v) for v in [os.getenv("CHANNEL_HI88_1", "-1004435825431")] if v],
+            "o8": [int(v) for v in [os.getenv("CHANNEL_O8_1", "-1003396129975")] if v],
         }
-        self._enqueue_telegram_message(payload)
 
-    def _enqueue_telegram_message(self, payload: dict[str, Any]):
-        chat_id = int(payload.get("chat_id") or 0)
-        message_id = int(payload.get("message_id") or 0)
-        if chat_id <= 0 or message_id <= 0:
-            return
-        text = str(payload.get("text") or "")
-        has_media = bool(payload.get("has_media"))
-        self.inbox.enqueue(chat_id, message_id, payload.get("message_date") or time.time(), bool(payload.get("edited", False)), text, has_media)
-
-    def _worker_loop(self):
-        logger.info("🔧 worker started")
-        while self.running:
-            pending = self.inbox.pending_ids(limit=50)
-            if not pending:
-                time.sleep(0.2)
-                continue
-            for row_id in pending:
-                row = self.inbox.claim(row_id)
-                if row is None:
-                    continue
-                try:
-                    codes = self._extract_codes_from_row(row)
-                    if not codes:
-                        self.inbox.mark_ignored(row_id, "no_code")
-                        continue
-                    items = []
-                    for idx, code in enumerate(codes):
-                        domain = self._guess_domain(code)
-                        if not domain:
-                            continue
-                        items.append({"code": code, "domain": domain, "target_url": f"https://{domain}", "fanout_index": idx})
-                    if not items:
-                        self.inbox.mark_ignored(row_id, "no_valid_code")
-                        continue
-                    self.inbox.create_work_items(row_id, items, claim_token=row.get("claim_token"))
-                    self.inbox.set_remaining(row_id, len(items), claim_token=row.get("claim_token"))
-                    self._process_domain_queue()
-                except Exception as exc:
-                    logger.error("❌ worker error: %s", exc)
-                    self.inbox.mark_failed(row_id, str(exc))
-
-    def _guess_domain(self, code: str) -> str | None:
-        for domain in ("xx88", "mm88", "rr88", "gg88", "qq88", "hi88", "o8"):
-            if code.startswith(domain.upper()) or code.startswith(domain[:2].upper()):
-                return domain
-        return "xx88"
-
-    def _extract_codes_from_row(self, row: dict[str, Any]) -> list[str]:
-        text = str(row.get("text") or "")
-        extracted = iter_codes_from_message(text, text, None, None)
-        if not extracted:
-            extracted = extract_codes_from_text(text)
-        return extracted
-
-    def _process_domain_queue(self):
-        for domain in self.config.active_domains:
-            while True:
-                item = self.queue_manager.pop(domain)
-                if item is None:
-                    break
-                result = self.adapter.submit(
-                    self._build_browser_task(domain, item.code, item.account, item.item_id)
-                )
-                logger.info("📨 submission result for %s/%s -> %s", domain, item.code, result.get("status"))
-
-    def _build_browser_task(self, domain: str, code: str, account: str, item_id: int | None = None):
-        from browser_adapter import BrowserTask
-        return BrowserTask(
-            domain=domain,
-            code=code,
-            account=account or "default-account",
-            site_url=f"https://{domain}",
-            item_id=item_id,
-        )
-
-    def stop(self):
-        self.running = False
-        self.database.close()
-        self.inbox.close()
+        Path(cfg.database_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(cfg.inbox_db_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(cfg.log_file).parent.mkdir(parents=True, exist_ok=True)
+        return cfg
 
 
-if __name__ == "__main__":
-    logger.info("🏁 Starting AutoBot")
-    bot = AutoBot()
-    bot.start()
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        logger.info("🛑 Halt requested")
-        bot.stop()
+def get_config(env_path: str | None = None) -> AppConfig:
+    return AppConfig.from_env(env_path)
+
+
+__all__ = ["AppConfig", "get_config"]

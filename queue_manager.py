@@ -1,4 +1,4 @@
-"""Adapter that translates queue tasks into site-specific browser actions."""
+"""Browser adapter used to translate queue items into browser actions."""
 
 from __future__ import annotations
 
@@ -37,3 +37,6 @@ class BrowserAdapter:
 
 
 __all__ = ["BrowserAdapter", "BrowserTask"]
+
+
+# browser_adapter.py

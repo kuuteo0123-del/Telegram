@@ -1,100 +1,44 @@
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
-
-from dotenv import load_dotenv
 
 
 @dataclass
-class AppConfig:
-    api_id: int = 0
-    api_hash: str = ""
-    session_name: str = "session_autobot"
-    alert_bot_token: str = ""
-    alert_chat_id: int = 0
-    telegram_admin_id: int = 0
-    database_path: str = "data/code_history.db"
-    inbox_db_path: str = "data/telegram_inbox.db"
-    log_file: str = "logs/bot_activity.log"
-    edge_cdp_host: str = "127.0.0.1"
-    edge_cdp_port: int = 9222
-    active_domains: list[str] = field(default_factory=lambda: ["xx88", "mm88", "rr88", "gg88", "qq88", "hi88", "o8"])
-    message_workers: int = 6
-    max_concurrent_processing: int = 50
-    channel_poll_interval: float = 1.0
-    max_inbox_attempts: int = 5
-    inbox_retry_base_delay: float = 2.0
-    inbox_retry_max_delay: float = 120.0
-    code_max_age_seconds: int = 120
+class SiteProfile:
+    domain: str
+    host: str
+    name: str
+    submit_selector: str = "button[type='submit']"
+    code_input_selector: str = "input[type='text']"
+    result_selector: str = "body"
+    max_tabs: int = 1
+    account_limit: int = 1
     requests_per_minute: int = 30
     max_burst: int = 5
-    accounts_per_code: int = 2
-    single_round_per_batch: bool = False
-    channel_ids: dict[str, list[int]] = field(default_factory=dict)
-    debug_verbose_mode: bool = False
-
-    @staticmethod
-    def from_env(env_path: str | None = None) -> "AppConfig":
-        if env_path:
-            load_dotenv(dotenv_path=env_path, override=False)
-        else:
-            load_dotenv(override=False)
-
-        cfg = AppConfig()
-        cfg.api_id = int(os.getenv("API_ID", "0") or 0)
-        cfg.api_hash = str(os.getenv("API_HASH", "") or "")
-        cfg.session_name = str(os.getenv("SESSION_NAME", "session_autobot") or "session_autobot")
-        cfg.alert_bot_token = str(os.getenv("ALERT_BOT_TOKEN", "") or "")
-        cfg.alert_chat_id = int(os.getenv("ALERT_CHAT_ID", "0") or 0)
-        cfg.telegram_admin_id = int(os.getenv("TELEGRAM_ADMIN_ID", "0") or 0)
-        cfg.database_path = str(os.getenv("DATABASE_PATH", "data/code_history.db") or "data/code_history.db")
-        cfg.inbox_db_path = str(os.getenv("TELEGRAM_INBOX_DB_PATH", "data/telegram_inbox.db") or "data/telegram_inbox.db")
-        cfg.log_file = str(os.getenv("LOG_FILE", "logs/bot_activity.log") or "logs/bot_activity.log")
-        cfg.edge_cdp_host = str(os.getenv("EDGE_CDP_HOST", "127.0.0.1") or "127.0.0.1")
-        cfg.edge_cdp_port = int(os.getenv("EDGE_CDP_PORT", "9222") or 9222)
-        cfg.message_workers = max(1, int(os.getenv("MESSAGE_WORKERS", "6") or 6))
-        cfg.max_concurrent_processing = max(1, int(os.getenv("MAX_CONCURRENT_PROCESSING", "50") or 50))
-        cfg.channel_poll_interval = float(os.getenv("CHANNEL_POLL_INTERVAL", "1.0") or 1.0)
-        cfg.max_inbox_attempts = max(1, int(os.getenv("MAX_INBOX_ATTEMPTS", "5") or 5))
-        cfg.inbox_retry_base_delay = max(0.1, float(os.getenv("INBOX_RETRY_BASE_DELAY", "2.0") or 2.0))
-        cfg.inbox_retry_max_delay = max(cfg.inbox_retry_base_delay, float(os.getenv("INBOX_RETRY_MAX_DELAY", "120.0") or 120.0))
-        cfg.code_max_age_seconds = max(1, int(os.getenv("CODE_MAX_AGE_SECONDS", "120") or 120))
-        cfg.requests_per_minute = max(1, int(os.getenv("REQUESTS_PER_MINUTE", "30") or 30))
-        cfg.max_burst = max(1, int(os.getenv("MAX_BURST", "5") or 5))
-        cfg.accounts_per_code = max(1, int(os.getenv("ACCOUNTS_PER_CODE", "2") or 2))
-        cfg.single_round_per_batch = str(os.getenv("SINGLE_ROUND_PER_BATCH", "false")).lower() == "true"
-        cfg.debug_verbose_mode = str(os.getenv("DEBUG_VERBOSE_MODE", "false")).lower() == "true"
-
-        active = os.getenv("ACTIVE_DOMAINS", "hi88,qq88,o8,mm88,rr88,xx88,gg88")
-        if active:
-            cfg.active_domains = [d.strip().lower() for d in active.split(",") if d.strip()]
-
-        cfg.channel_ids = {
-            "xx88": [
-                int(v) for v in [
-                    os.getenv("CHANNEL_XX88_1", "-1002817093108"),
-                    os.getenv("CHANNEL_XX88_2", "-1002768264448"),
-                ] if v
-            ],
-            "mm88": [int(v) for v in [os.getenv("CHANNEL_MM88_1", "-1003134541072")] if v],
-            "rr88": [int(v) for v in [os.getenv("CHANNEL_RR88_1", "-1002386905514")] if v],
-            "gg88": [int(v) for v in [os.getenv("CHANNEL_GG88_1", "-1003731231345")] if v],
-            "qq88": [int(v) for v in [os.getenv("CHANNEL_QQ88_1", "-1002421765170")] if v],
-            "hi88": [int(v) for v in [os.getenv("CHANNEL_HI88_1", "-1004435825431")] if v],
-            "o8": [int(v) for v in [os.getenv("CHANNEL_O8_1", "-1003396129975")] if v],
-        }
-
-        Path(cfg.database_path).parent.mkdir(parents=True, exist_ok=True)
-        Path(cfg.inbox_db_path).parent.mkdir(parents=True, exist_ok=True)
-        Path(cfg.log_file).parent.mkdir(parents=True, exist_ok=True) if False else None
-        return cfg
+    retry_wait_seconds: float = 5.0
+    fields: dict[str, Any] = field(default_factory=dict)
 
 
-def get_config(env_path: str | None = None) -> AppConfig:
-    return AppConfig.from_env(env_path)
+SITE_PROFILES: dict[str, SiteProfile] = {
+    "xx88": SiteProfile(domain="xx88code.com", host="https://xx88code.com", name="XX88", code_input_selector="input[name='code']", max_tabs=2, account_limit=2),
+    "mm88": SiteProfile(domain="livemm88.net", host="https://livemm88.net", name="MM88", code_input_selector="input[name='code']", max_tabs=2, account_limit=2),
+    "rr88": SiteProfile(domain="rr88code.com", host="https://rr88code.com", name="RR88", code_input_selector="input[name='code']", max_tabs=2, account_limit=2),
+    "gg88": SiteProfile(domain="gg88live.tv", host="https://gg88live.tv", name="GG88", code_input_selector="input[name='code']", max_tabs=2, account_limit=2),
+    "qq88": SiteProfile(domain="tangquaqq88.com", host="https://tangquaqq88.com", name="QQ88", code_input_selector="input[name='code']", max_tabs=1, account_limit=1),
+    "hi88": SiteProfile(domain="hi88-freecode.pages.dev", host="https://hi88-freecode.pages.dev", name="HI88", code_input_selector="input[name='code']", max_tabs=1, account_limit=1),
+    "o8": SiteProfile(domain="o8code.com", host="https://o8code.com", name="O8", code_input_selector="input[name='code']", max_tabs=1, account_limit=1),
+}
 
 
-__all__ = ["AppConfig", "get_config"]
+def get_site_profile(domain: str) -> SiteProfile:
+    normalized = domain.lower().replace("https://", "").replace("http://", "")
+    if "." in normalized:
+        normalized = normalized.split(".")[0]
+    return SITE_PROFILES.get(normalized, SITE_PROFILES["xx88"])
+
+
+__all__ = ["SiteProfile", "SITE_PROFILES", "get_site_profile"]
+
+
+# browser_site_profiles.py

@@ -1,275 +1,127 @@
-"""Database manager with WAL + batch writes."""
-
 from __future__ import annotations
 
-import sqlite3
-import threading
-from datetime import datetime
+import os
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
-from logger_setup import logger
-
-
-class CodeDatabase:
-    def __init__(self, db_path: str = "data/code_history.db", stats_batch_size: int = 50):
-        self.db_path = db_path
-        self.stats_batch_size = max(1, int(stats_batch_size))
-        self._lock = threading.RLock()
-        self._pending_account_stats: dict[str, dict] = {}
-        self._pending_website_stats: dict[str, dict] = {}
-        self._pending_stats_events = 0
-
-        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=10.0)
-        self.conn.row_factory = sqlite3.Row
-        self._configure()
-        self._init_tables()
-
-    def _configure(self):
-        pragmas = [
-            "PRAGMA journal_mode=WAL",
-            "PRAGMA synchronous=NORMAL",
-            "PRAGMA busy_timeout=10000",
-            "PRAGMA cache_size=-32000",
-            "PRAGMA temp_store=MEMORY",
-        ]
-        for pragma in pragmas:
-            try:
-                self.conn.execute(pragma)
-            except Exception:
-                pass
-        self.conn.commit()
-
-    def _init_tables(self):
-        with self._lock:
-            self.conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS code_submission (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    code TEXT NOT NULL,
-                    account TEXT NOT NULL,
-                    website TEXT NOT NULL,
-                    status TEXT,
-                    result TEXT,
-                    submitted_at TIMESTAMP,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(code, account)
-                )
-                """
-            )
-            self.conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS used_codes (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    domain TEXT NOT NULL,
-                    code TEXT NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(domain, code)
-                )
-                """
-            )
-            self.conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS submission_log (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    code TEXT NOT NULL,
-                    account TEXT NOT NULL,
-                    website TEXT NOT NULL,
-                    status TEXT,
-                    result TEXT,
-                    attempt INTEGER,
-                    submitted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-                """
-            )
-            self.conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS account_stats (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    account TEXT NOT NULL UNIQUE,
-                    total_submitted INTEGER DEFAULT 0,
-                    total_success INTEGER DEFAULT 0,
-                    total_failed INTEGER DEFAULT 0,
-                    last_submit TIMESTAMP,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-                """
-            )
-            self.conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS website_stats (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    website TEXT NOT NULL UNIQUE,
-                    total_submitted INTEGER DEFAULT 0,
-                    total_success INTEGER DEFAULT 0,
-                    total_failed INTEGER DEFAULT 0,
-                    last_submit TIMESTAMP,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-                """
-            )
-            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_code ON code_submission(code)")
-            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_account ON submission_log(account)")
-            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_website ON submission_log(website)")
-            self.conn.execute("CREATE INDEX IF NOT EXISTS idx_submitted_at ON submission_log(submitted_at)")
-            self.conn.commit()
-
-    def _queue_stats_locked(self, account: str, website: str, status: str, now: datetime):
-        account_row = self._pending_account_stats.setdefault(
-            account, {"total": 0, "success": 0, "failed": 0, "last_submit": now}
-        )
-        website_row = self._pending_website_stats.setdefault(
-            website, {"total": 0, "success": 0, "failed": 0, "last_submit": now}
-        )
-        for row in (account_row, website_row):
-            row["total"] += 1
-            row["last_submit"] = now
-            if status == "SUCCESS":
-                row["success"] += 1
-            elif status == "FAILED":
-                row["failed"] += 1
-        self._pending_stats_events += 1
-
-    def _flush_stats_locked(self) -> int:
-        if not self._pending_stats_events:
-            return 0
-        account_rows = list(self._pending_account_stats.items())
-        website_rows = list(self._pending_website_stats.items())
-        events = self._pending_stats_events
-        try:
-            self.conn.executemany(
-                """
-                INSERT INTO account_stats (
-                    account, total_submitted, total_success, total_failed, last_submit
-                ) VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(account) DO UPDATE SET
-                    total_submitted=account_stats.total_submitted + excluded.total_submitted,
-                    total_success=account_stats.total_success + excluded.total_success,
-                    total_failed=account_stats.total_failed + excluded.total_failed,
-                    last_submit=excluded.last_submit
-                """,
-                [(key, row["total"], row["success"], row["failed"], row["last_submit"]) for key, row in account_rows],
-            )
-            self.conn.executemany(
-                """
-                INSERT INTO website_stats (
-                    website, total_submitted, total_success, total_failed, last_submit
-                ) VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(website) DO UPDATE SET
-                    total_submitted=website_stats.total_submitted + excluded.total_submitted,
-                    total_success=website_stats.total_success + excluded.total_success,
-                    total_failed=website_stats.total_failed + excluded.total_failed,
-                    last_submit=excluded.last_submit
-                """,
-                [(key, row["total"], row["success"], row["failed"], row["last_submit"]) for key, row in website_rows],
-            )
-            self.conn.commit()
-        except Exception:
-            self.conn.rollback()
-            raise
-
-        self._pending_account_stats.clear()
-        self._pending_website_stats.clear()
-        self._pending_stats_events = 0
-        return events
-
-    def flush_stats(self) -> int:
-        with self._lock:
-            try:
-                return self._flush_stats_locked()
-            except Exception as exc:
-                logger.error("❌ Lỗi flush stats: %s", exc)
-                return 0
-
-    def record_submission(self, code: str, account: str, website: str, status: str, result: str | None = None, attempt: int = 1):
-        with self._lock:
-            try:
-                now = datetime.now()
-                self.conn.execute(
-                    """
-                    INSERT INTO submission_log (code, account, website, status, result, attempt)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (code, account, website, status, result, attempt),
-                )
-                self.conn.execute(
-                    """
-                    INSERT OR REPLACE INTO code_submission
-                    (code, account, website, status, result, submitted_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (code, account, website, status, result, now),
-                )
-                self.conn.commit()
-                self._queue_stats_locked(account, website, status, now)
-                if self._pending_stats_events >= self.stats_batch_size:
-                    self._flush_stats_locked()
-            except Exception as exc:
-                logger.error("❌ record_submission error: %s", exc)
-                try:
-                    self.conn.rollback()
-                except Exception:
-                    pass
-
-    def is_code_used(self, domain: str, code: str) -> bool:
-        with self._lock:
-            row = self.conn.execute(
-                "SELECT 1 FROM used_codes WHERE domain=? AND code=?",
-                (domain, code.upper()),
-            ).fetchone()
-            return row is not None
-
-    def unused_codes(self, domain: str, codes) -> set[str]:
-        items = list(dict.fromkeys(str(code or "").strip().upper() for code in (codes or []) if str(code or "").strip()))
-        if not items:
-            return set()
-        placeholders = ",".join("?" for _ in items)
-        with self._lock:
-            rows = self.conn.execute(
-                f"SELECT code FROM used_codes WHERE domain=? AND code IN ({placeholders})",
-                (domain, *items),
-            ).fetchall()
-            used = {str(row[0]).upper() for row in rows}
-            return {code for code in items if code not in used}
-
-    def mark_code_used(self, domain: str, code: str) -> bool:
-        with self._lock:
-            try:
-                self.conn.execute("INSERT INTO used_codes (domain, code) VALUES (?, ?)", (domain, code.upper()))
-                self.conn.commit()
-                return True
-            except sqlite3.IntegrityError:
-                self.conn.rollback()
-                return False
-            except Exception as exc:
-                logger.error("❌ mark_code_used error: %s", exc)
-                self.conn.rollback()
-                return False
-
-    def clear_domain_dedup(self, domain: str) -> int:
-        with self._lock:
-            cur = self.conn.execute("DELETE FROM used_codes WHERE domain=?", (domain,))
-            self.conn.commit()
-            return int(cur.rowcount or 0)
-
-    def close(self):
-        with self._lock:
-            try:
-                self._flush_stats_locked()
-            except Exception as exc:
-                logger.error("❌ close flush stats: %s", exc)
-            try:
-                self.conn.close()
-            except Exception as exc:
-                logger.error("❌ close DB: %s", exc)
+from dotenv import load_dotenv
 
 
-def init_database(db_path: str = "data/code_history.db") -> CodeDatabase:
-    return CodeDatabase(db_path)
+@dataclass
+class AppConfig:
+    api_id: int = 0
+    api_hash: str = ""
+    session_name: str = "session_autobot"
+    alert_bot_token: str = ""
+    alert_chat_id: int = 0
+    telegram_admin_id: int = 0
+    database_path: str = "data/code_history.db"
+    inbox_db_path: str = "data/telegram_inbox.db"
+    log_file: str = "logs/bot_activity.log"
+    edge_cdp_host: str = "127.0.0.1"
+    edge_cdp_port: int = 9222
+    edge_executable_path: str | None = None
+    active_domains: list[str] = field(default_factory=lambda: ["xx88", "mm88", "rr88", "gg88", "qq88", "hi88", "o8"])
+    channel_ids: dict[str, list[int]] = field(default_factory=dict)
+
+    # runtime
+    channel_poll_interval: float = 1.0
+    channel_poll_request_timeout: float = 5.0
+    channel_poll_max_inflight: int = 3
+    code_max_age_seconds: int = 120
+    max_inbox_attempts: int = 5
+    inbox_retry_base_delay: float = 2.0
+    inbox_retry_max_delay: float = 120.0
+    max_concurrent_processing: int = 50
+    message_workers: int = 6
+    max_concurrent_submits_per_domain: int = 2
+
+    # browser
+    accounts_per_code: int = 2
+    single_round_per_batch: bool = False
+    requests_per_minute: int = 30
+    max_burst: int = 5
+    retry_on_timeout: bool = True
+
+    # defaults for telemetry/logging
+    debug_verbose_mode: bool = False
+    log_level: str = "INFO"
+
+    @staticmethod
+    def _bool(v: str | None, default: bool = False) -> bool:
+        if v is None:
+            return default
+        return str(v).strip().lower() in {"1", "true", "yes", "on"}
+
+    @classmethod
+    def from_env(cls, env_path: str | None = None) -> "AppConfig":
+        if env_path:
+            load_dotenv(dotenv_path=env_path, override=False)
+        else:
+            load_dotenv(override=False)
+
+        cfg = cls()
+        cfg.api_id = int(os.getenv("API_ID", "0") or 0)
+        cfg.api_hash = str(os.getenv("API_HASH", "") or "")
+        cfg.session_name = str(os.getenv("SESSION_NAME", "session_autobot") or "session_autobot")
+        cfg.alert_bot_token = str(os.getenv("ALERT_BOT_TOKEN", "") or "")
+        cfg.alert_chat_id = int(os.getenv("ALERT_CHAT_ID", "0") or 0)
+        cfg.telegram_admin_id = int(os.getenv("TELEGRAM_ADMIN_ID", "0") or 0)
+        cfg.database_path = str(os.getenv("DATABASE_PATH", "data/code_history.db") or "data/code_history.db")
+        cfg.inbox_db_path = str(os.getenv("TELEGRAM_INBOX_DB_PATH", "data/telegram_inbox.db") or "data/telegram_inbox.db")
+        cfg.log_file = str(os.getenv("LOG_FILE", "logs/bot_activity.log") or "logs/bot_activity.log")
+        cfg.edge_cdp_host = str(os.getenv("EDGE_CDP_HOST", "127.0.0.1") or "127.0.0.1")
+        cfg.edge_cdp_port = int(os.getenv("EDGE_CDP_PORT", "9222") or 9222)
+        cfg.edge_executable_path = os.getenv("EDGE_EXECUTABLE_PATH") or None
+        cfg.channel_poll_interval = float(os.getenv("CHANNEL_POLL_INTERVAL", "1.0") or 1.0)
+        cfg.channel_poll_request_timeout = float(os.getenv("CHANNEL_POLL_REQUEST_TIMEOUT", "5.0") or 5.0)
+        cfg.channel_poll_max_inflight = max(1, int(os.getenv("CHANNEL_POLL_MAX_INFLIGHT", "3") or 3))
+        cfg.code_max_age_seconds = max(1, int(os.getenv("CODE_MAX_AGE_SECONDS", "120") or 120))
+        cfg.max_inbox_attempts = max(1, int(os.getenv("MAX_INBOX_ATTEMPTS", "5") or 5))
+        cfg.inbox_retry_base_delay = max(0.1, float(os.getenv("INBOX_RETRY_BASE_DELAY", "2.0") or 2.0))
+        cfg.inbox_retry_max_delay = max(cfg.inbox_retry_base_delay, float(os.getenv("INBOX_RETRY_MAX_DELAY", "120.0") or 120.0))
+        cfg.max_concurrent_processing = max(1, int(os.getenv("MAX_CONCURRENT_PROCESSING", "50") or 50))
+        cfg.message_workers = max(1, int(os.getenv("MESSAGE_WORKERS", "6") or 6))
+        cfg.max_concurrent_submits_per_domain = max(1, int(os.getenv("MAX_CONCURRENT_SUBMITS_PER_DOMAIN", "2") or 2))
+        cfg.accounts_per_code = max(1, int(os.getenv("ACCOUNTS_PER_CODE", "2") or 2))
+        cfg.single_round_per_batch = cls._bool(os.getenv("SINGLE_ROUND_PER_BATCH"), False)
+        cfg.requests_per_minute = max(1, int(os.getenv("REQUESTS_PER_MINUTE", "30") or 30))
+        cfg.max_burst = max(1, int(os.getenv("MAX_BURST", "5") or 5))
+        cfg.retry_on_timeout = cls._bool(os.getenv("RETRY_ON_TIMEOUT"), True)
+        cfg.debug_verbose_mode = cls._bool(os.getenv("DEBUG_VERBOSE_MODE"), False)
+        cfg.log_level = str(os.getenv("LOG_LEVEL", "INFO") or "INFO").upper()
+
+        active = os.getenv("ACTIVE_DOMAINS", "hi88,qq88,o8,mm88,rr88,xx88,gg88")
+        if active:
+            cfg.active_domains = [d.strip().lower() for d in active.split(",") if d.strip()]
+
+        # default channel set
+        defaults = {
+            "xx88": [
+                int(os.getenv("CHANNEL_XX88_1", "-1002817093108") or -1002817093108),
+                int(os.getenv("CHANNEL_XX88_2", "-1002768264448") or -1002768264448),
+            ],
+            "mm88": [int(os.getenv("CHANNEL_MM88_1", "-1003134541072") or -1003134541072)],
+            "rr88": [int(os.getenv("CHANNEL_RR88_1", "-1002386905514") or -1002386905514)],
+            "gg88": [int(os.getenv("CHANNEL_GG88_1", "-1003731231345") or -1003731231345)],
+            "qq88": [int(os.getenv("CHANNEL_QQ88_1", "-1002421765170") or -1002421765170)],
+            "hi88": [int(os.getenv("CHANNEL_HI88_1", "-1004435825431") or -1004435825431)],
+            "o8": [int(os.getenv("CHANNEL_O8_1", "-1003396129975") or -1003396129975)],
+        }
+        cfg.channel_ids = {key: sorted(set(value)) for key, value in defaults.items()}
+
+        Path(cfg.database_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(cfg.inbox_db_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(cfg.log_file).parent.mkdir(parents=True, exist_ok=True)
+        return cfg
 
 
-def get_database() -> CodeDatabase:
-    return init_database()
+def get_config(env_path: str | None = None) -> AppConfig:
+    return AppConfig.from_env(env_path)
 
 
-__all__ = ["CodeDatabase", "init_database", "get_database"]
+__all__ = ["AppConfig", "get_config"]
+
+
+# config.py

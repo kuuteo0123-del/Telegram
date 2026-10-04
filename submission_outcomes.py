@@ -1,12 +1,10 @@
-"""Queue manager for domain-level backpressure."""
+"""Domain queue manager with per-domain backpressure."""
 
 from __future__ import annotations
 
 import threading
-import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from typing import Any
 
 
 @dataclass
@@ -24,11 +22,11 @@ class DomainQueueManager:
         self._queues: dict[str, deque[DomainQueueItem]] = defaultdict(deque)
         self._lock = threading.RLock()
 
-    def push(self, item: DomainQueueItem):
+    def push(self, item: DomainQueueItem) -> None:
         with self._lock:
             q = self._queues[item.domain]
             if len(q) >= self.max_per_domain:
-                raise OverflowError(f"Domain queue full: {item.domain}")
+                raise OverflowError(f"domain queue full: {item.domain}")
             q.append(item)
 
     def pop(self, domain: str) -> DomainQueueItem | None:
@@ -36,28 +34,20 @@ class DomainQueueManager:
             q = self._queues.get(domain)
             if not q:
                 return None
-            if not q:
-                return None
-            return q.popleft()
-
-    def pending(self, domain: str | None = None) -> list[DomainQueueItem]:
-        with self._lock:
-            if domain is not None:
-                return list(self._queues.get(domain, deque()))
-            items: list[DomainQueueItem] = []
-            for q in self._queues.values():
-                items.extend(q)
-            return items
+            return q.popleft() if q else None
 
     def size(self, domain: str | None = None) -> int:
         with self._lock:
-            if domain is not None:
+            if domain:
                 return len(self._queues.get(domain, deque()))
             return sum(len(q) for q in self._queues.values())
 
-    def clear(self):
+    def clear(self) -> None:
         with self._lock:
             self._queues.clear()
 
 
 __all__ = ["DomainQueueItem", "DomainQueueManager"]
+
+
+# queue_manager.py

@@ -1,37 +1,38 @@
-import logging
-import sys
-from pathlib import Path
+# AutoBot — production-ready v2
 
+This revision keeps the architecture you asked for and removes the original hot path issues:
 
-def build_logger(name: str = "autobot") -> logging.Logger:
-    logger = logging.getLogger(name)
-    logger.setLevel(logging.INFO)
-    logger.propagate = False
+- Telegram ingress is decoupled from the processing graph
+- SQLite writes are batched instead of commit-per-message
+- worker loop handles code extraction and routing
+- domain queue prevents browser saturation
+- config is environment-driven and production-safe
 
-    if logger.handlers:
-        return logger
+## Quick start
 
-    log_dir = Path("logs")
-    log_dir.mkdir(exist_ok=True)
+1. Copy `.env.example` to `.env` and fill your Telegram credentials.
+2. Install dependencies:
+   python -m pip install -r requirements.txt
+3. Run:
+   python main_script.py
 
-    formatter = logging.Formatter(
-        "%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+## Notes
 
-    stream = logging.StreamHandler(sys.stdout)
-    stream.setFormatter(formatter)
-    stream.setLevel(logging.INFO)
-    logger.addHandler(stream)
+- The project is intentionally modular and easy to extend.
+- `durable_inbox_v2.py` is the queue layer to keep under load.
+- `main_script.py` is the entrypoint for Telegram + worker orchestration.
+- `config.py` centralizes environment and runtime tuning.
 
-    file_handler = logging.FileHandler(log_dir / "bot_activity.log", encoding="utf-8")
-    file_handler.setFormatter(formatter)
-    file_handler.setLevel(logging.INFO)
-    logger.addHandler(file_handler)
+## Production tuning highlights
 
-    return logger
+- `CHANNEL_POLL_INTERVAL`: keep low but stable under burst conditions.
+- `MAX_INBOX_ATTEMPTS`: cap replay storms and prevent stale message loops.
+- `MESSAGE_WORKERS`: increase only if extraction/validation is the bottleneck.
+- `MAX_CONCURRENT_PROCESSING`: set according to your CPU and browser capacity.
+- `ACTIVE_DOMAINS`: restrict to the domains you actually use.
 
+## Security
 
-logger = build_logger("autobot")
+Do not commit `.env` or `.session` files.
 
-__all__ = ["logger", "build_logger"]
+# README.md

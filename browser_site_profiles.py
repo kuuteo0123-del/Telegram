@@ -1,12 +1,11 @@
-"""Code validation utilities for giftcode extraction."""
+"""Code validation and extraction utilities."""
 
 from __future__ import annotations
 
 import re
-from typing import Iterable
 
 
-AD_RE = re.compile(r"(CHUCMUNG|TANGLIXI|XINH|GIAI|NHAN|CODE|GIFT|QUA|GIFTCODE|VIP|HOT|FREE|MÃ|HƯNG|BỘ|FLASH|RA|KHEN|NEW)", re.I)
+AD_RE = re.compile(r"(CHUCMUNG|TANGLIXI|XINH|GIAI|NHAN|CODE|GIFT|QUA|GIFTCODE|VIP|HOT|FREE|MÃ|HƯNG|BỘ|FLASH|NEW)", re.I)
 
 
 def normalize_code(value: str) -> str:
@@ -22,8 +21,6 @@ def looks_like_advertisement(text: str) -> bool:
     cleaned = normalize_code(text)
     if len(cleaned) < 4:
         return False
-    if re.search(r"(?:[A-Z]{4,})", cleaned):
-        return False
     return bool(AD_RE.search(text))
 
 
@@ -35,47 +32,35 @@ def is_valid_site_code(code: str, site_hint: str | None = None) -> bool:
         return False
     if looks_like_advertisement(item):
         return False
-    # site-specific sanity checks
-    h = (site_hint or "").lower()
-    patterns = {
-        "xx88": r"^[A-Z0-9]{6,10}$",
-        "mm88": r"^(MM88|M88|[A-Z0-9]{6,10})$",
-        "rr88": r"^[A-Z0-9]{6,10}$",
-        "gg88": r"^[A-Z0-9]{6,10}$",
-        "qq88": r"^(QQ|QQ88|[A-Z0-9]{6,10})$",
-        "hi88": r"^[A-Z0-9]{6,10}$",
-        "o8": r"^[A-Z0-9]{6,10}$",
-    }
-    if h and h in patterns and not re.match(patterns[h], item):
-        return False
-    return True
+    if site_hint:
+        site = site_hint.lower()
+        if site in {"xx88", "mm88", "rr88", "gg88", "qq88", "hi88", "o8"}:
+            return bool(re.fullmatch(r"[A-Z0-9]{6,12}", item))
+    return bool(re.fullmatch(r"[A-Z0-9]{6,12}", item))
 
 
 def extract_codes_from_text(text: str, site_hint: str | None = None) -> list[str]:
     if not text:
         return []
-    matches = set()
-    chunks = re.findall(r"[A-Z0-9]{6,12}", text.upper())
-    for chunk in chunks:
+    seen: set[str] = set()
+    for chunk in re.findall(r"[A-Z0-9]{6,12}", text.upper()):
         code = normalize_code(chunk)
-        if len(code) < 6:
-            continue
-        if looks_like_advertisement(code):
-            continue
-        if is_valid_site_code(code, site_hint):
-            matches.add(code)
-    return sorted(matches)
+        if len(code) >= 6 and is_valid_site_code(code, site_hint) and not looks_like_advertisement(code):
+            seen.add(code)
+    return sorted(seen)
 
 
 def iter_codes_from_message(message_text: str | None, caption: str | None = None, spoiler: str | None = None, site_hint: str | None = None) -> list[str]:
+    results: list[str] = []
     seen: set[str] = set()
-    for part in (spoiler, message_text, caption):
+    for part in (message_text, caption, spoiler):
         if not part:
             continue
         for code in extract_codes_from_text(part, site_hint):
             if code not in seen:
                 seen.add(code)
-    return sorted(seen)
+                results.append(code)
+    return results
 
 
 __all__ = [
@@ -85,3 +70,6 @@ __all__ = [
     "extract_codes_from_text",
     "iter_codes_from_message",
 ]
+
+
+# code_validator.py
